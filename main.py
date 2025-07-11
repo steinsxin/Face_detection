@@ -15,17 +15,29 @@ from std_msgs.msg import String
 
 from utils.ros_server import RosNode
 
+LOST_FACE_MAX_COUNT = 5 
+
 class SharedState:
-    """
-    用于线程间共享图像数据的状态容器。
-    """
     def __init__(self):
         self._color_image: Optional[np.ndarray] = None
         self._depth_image: Optional[np.ndarray] = None
         self.image_ready = False
         self.lock = threading.Lock()
-        self.face_detected: bool = False
+
+        self._face_start_time: Optional[float] = None
+        self._face_confirmed_time: Optional[float] = None
+        self._last_face_duration: float = 0.0
+
+        self.face_confirmed: bool = False
         self.face_distance: float = 0.0
+        self.check_time = 5.0
+
+        self.audio_done: bool = True
+        self.action_done: bool = True
+
+        self._face_duration: float = 0.0  # 实时持续时间
+        self._last_update_time: float = time.time()  # 上一次更新的时间戳
+
 
     def update_images(self, color: np.ndarray, depth: np.ndarray):
         with self.lock:
@@ -41,13 +53,72 @@ class SharedState:
             return None, None
 
     def update_face_info(self, detected: bool, distance: float):
+        now = time.time()
+        dt = now - self._last_update_time
+        self._last_update_time = now
+
         with self.lock:
-            self.face_detected = detected
-            self.face_distance = distance
+            # 人脸检测中，更新持续时间
+            if detected and 0.3 <= distance <= 2.0:
+                if self._face_start_time is None:
+                    self._face_start_time = now
+                    self._face_duration = 0.0
+                else:
+                    if self._face_duration < self.check_time:
+                        self._face_duration += dt  # 实时增长(限制在检测时间内)
+                
+                if not self.face_confirmed and self._face_duration >= self.check_time:
+                    self.face_confirmed = True
+                    self._face_confirmed_time = now
+                    self.face_distance = distance
+
+            else:
+                # 人脸丢失时，持续时间逐渐减少
+                self._face_duration -= dt
+                if self._face_duration < 0.0:
+                    self._face_duration = 0.0
+
+                if self.face_confirmed and self._face_start_time is not None:
+                    self._face_start_time = None
+                    self._face_confirmed_time = None
+                    self.face_confirmed = False
+                    self.face_distance = 0.0
+
+    def get_face_duration(self) -> float:
+        with self.lock:
+            return self._face_duration
 
     def get_face_info(self) -> Tuple[bool, float]:
         with self.lock:
-            return self.face_detected, self.face_distance
+            return self.face_confirmed, self.face_distance
+
+    def get_last_face_duration(self) -> float:
+        with self.lock:
+            return self._last_face_duration
+
+    def mark_audio_done(self):
+        with self.lock:
+            self.audio_done = True
+
+    def mark_action_done(self):
+        with self.lock:
+            self.action_done = True
+
+    def all_tasks_done(self) -> bool:
+        with self.lock:
+            return self.audio_done and self.action_done
+
+    def reset_all_face_state(self):
+        with self.lock:
+            self._face_start_time = None
+            self._face_confirmed_time = None
+            self._face_duration = 0.0
+            self._last_face_duration = 0.0
+            self.face_confirmed = False
+            self.face_distance = 0.0
+            self.action_triggered = False
+            self.audio_done = False
+            self.action_done = False
 
 
 def capture_camera_loop(camera: RealSenseCamera, state: SharedState, stop_event: threading.Event) -> None:
@@ -69,55 +140,68 @@ def capture_camera_loop(camera: RealSenseCamera, state: SharedState, stop_event:
         camera.stop()
         print("[Camera] Stopped.")
 
-
-def face_detection_loop(detector, state, stop_event: threading.Event) -> None:
-    """
-    人脸检测线程：使用 color + depth 图像进行处理。
-    """
+def face_detection_loop(detector, state: SharedState, stop_event: threading.Event) -> None:
     try:
+        lost_counter = 0
+
         while not stop_event.is_set():
+            if state.all_tasks_done():
+                print("[FaceDetector] All tasks done. Resetting state.")
+                state.reset_all_face_state()
+
             color_image, depth_image = state.get_latest_frame_pair()
 
             if color_image is not None and depth_image is not None:
                 has_face, boxes = detector.detect_faces(color_image)
-                print("[FaceDetector] Detected face." if has_face else "[FaceDetector] No face detected.")
+
                 if has_face:
                     distance = detector.distance_solve(color_image, boxes)
                     if distance is not None:
-                        print(f"[FaceDetector] Estimated face distance: {distance / 1000:.2f} meters")
-                        state.update_face_info(True, distance / 1000)  # 转换为米
+                        state.update_face_info(True, distance / 1000)
+                        lost_counter = 0 
                     else:
-                        print("[FaceDetector] Failed to estimate face distance.")
-                        state.update_face_info(False, 0.0)
+                        lost_counter += 1
+                        if lost_counter >= LOST_FACE_MAX_COUNT:
+                            state.update_face_info(False, 0.0)
                 else:
-                    print("[FaceDetector] No face detected.")
-                    state.update_face_info(False, 0.0)
-            else:
-                print("[FaceDetector] No new color or depth image.")
+                    lost_counter += 1
+                    if lost_counter >= LOST_FACE_MAX_COUNT:
+                        state.update_face_info(False, 0.0)
 
-            time.sleep(2)
+                face_confirmed, face_distance = state.get_face_info()
+
+                if face_confirmed:
+                    print(f"[FaceDetector] Confirmed face at {face_distance:.2f} meters")
+
+                duration = state.get_face_duration()
+                print(f"[FaceDetector] Current face duration: {duration:.2f} seconds")
+
+            time.sleep(0.05)
     except Exception:
         print("[FaceDetector] Exception occurred:")
         traceback.print_exc()
     finally:
         print("[FaceDetector] Stopped.")
 
+
 def action_loop(node: RosNode, state: SharedState, stop_event: threading.Event) -> None:
     try:
         while not stop_event.is_set():
             has_face, distance = state.get_face_info()
-            if has_face and 0.3 <= distance <= 2.0:
-                action_dict = {
-                    "action": "bow_salute",  
-                    "status": "run",
+            if has_face:
+                audio_dict = {
+                    "target": "gpt",
+                    "text": "你好，我是智动1号机器人"
                 }
                 msg = String()
-                msg.data = json.dumps(action_dict)
-                node.robot_action_pub.publish(msg)
-                print("[Action] Published action message:", msg.data)
-            else:
-                print(f"[Action] Skipped. Face: {has_face}, Distance: {distance:.2f}m")
-            time.sleep(2)
+                msg.data = json.dumps(audio_dict)
+                node.audio_topic_pub.publish(msg)
+                print("[Audio] Published audio message:", msg.data)
+
+                time.sleep(node.time_sleep)
+                state.mark_audio_done()
+
+            time.sleep(0.05)
     except Exception:
         print("[Action] Exception occurred:")
         traceback.print_exc()
@@ -128,17 +212,20 @@ def audio_loop(node: RosNode, state: SharedState, stop_event: threading.Event) -
     try:
         while not stop_event.is_set():
             has_face, distance = state.get_face_info()
-            if has_face and 0.3 <= distance <= 2.0:
-                audio_dict = {
-                    "target": "gpt",  
-                    "text": "你好，请问你是谁",
+            if has_face:
+                action_dict = {
+                    "action": "bow_salute",
+                    "status": "run",
                 }
                 msg = String()
-                msg.data = json.dumps(audio_dict)
-                node.audio_text_pub.publish(msg)
-                print("[Audio] Published audio message:", msg.data)
-                
-            time.sleep(2)
+                msg.data = json.dumps(action_dict)
+                node.robot_action_pub.publish(msg)
+                print("[Action] Published action message:", msg.data)
+
+                time.sleep(node.time_sleep)
+                state.mark_action_done()
+
+            time.sleep(0.05)
     except Exception:
         print("[Audio] Exception occurred:")
         traceback.print_exc()
